@@ -1,18 +1,20 @@
 # Zibris VCD Inventory
 
-Web-UI zum Auslesen von **vApps** und **VMs** aus VMware Cloud Director (Zibris Cloud).
+Web UI to list **vApps** and **VMs** from VMware Cloud Director (Zibris Cloud).
 
-Login mit Org-User → Übersicht mit CPU, RAM, HDD → Filter nach VDC → Export als **Excel** oder **CSV**.
+Sign in with an org user → overview with CPU, RAM, HDD → filter by VDC → export as **Excel** or **CSV**.
 
-Läuft ausschließlich als **Docker-Container**.
+Runs exclusively as a **Docker container**.
 
-## Voraussetzungen
+The user interface is in **German**.
+
+## Requirements
 
 - [Docker](https://docs.docker.com/get-docker/)
 - [Docker Compose](https://docs.docker.com/compose/)
-- Zugang zu VMware Cloud Director (Benutzer, Organisation, Passwort)
+- Access to VMware Cloud Director (username, organization, password)
 
-## Schnellstart
+## Quick start
 
 ```bash
 git clone https://github.com/nycon/zibris-inventory-tool.git
@@ -20,9 +22,9 @@ cd zibris-inventory-tool
 docker compose up -d --build
 ```
 
-UI öffnen: [http://127.0.0.1:8080](http://127.0.0.1:8080)
+Open the UI: [http://127.0.0.1:8080](http://127.0.0.1:8080)
 
-Stoppen:
+Stop:
 
 ```bash
 docker compose down
@@ -36,66 +38,66 @@ docker compose logs -f
 
 ## Login
 
-Im Browser:
+In the browser:
 
-| Feld | Beispiel |
-|------|----------|
+| Field | Example |
+|-------|---------|
 | Portal URL | `https://portal.zibris-cloud.ch` |
-| Benutzer | `username` |
-| Organisation | `org name` |
-| Passwort | dein Passwort |
+| Username | `username` |
+| Organization | `org name` |
+| Password | your password |
 
-Die API meldet sich als `benutzer@organisation` an (Basic Auth gegen `/cloudapi/1.0.0/sessions`).
+The API authenticates as `username@organization` (Basic Auth against `/cloudapi/1.0.0/sessions`).
 
-## Funktionen
+## Features
 
-- Liste aller **vApps** mit Status, VDC, CPU, RAM, HDD
-- Aufklappen → zugehörige **VMs** (OS, Netz, Ressourcen)
-- Suche und Filter (Status, VDC)
-- Kennzahlen: vApps, VMs, CPU, RAM, Storage (Total in TiB ab 1024 GiB)
-- **Excel / CSV Export**
-  - Filter **Alle VDCs** → gesamtes Inventory
-  - Filter **ein VDC** → nur vApps/VMs dieses VDCs
+- List all **vApps** with status, VDC, CPU, RAM, HDD
+- Expand → related **VMs** (OS, network, resources)
+- Search and filters (status, VDC)
+- Totals: vApps, VMs, CPU, RAM, storage (total in TiB from 1024 GiB)
+- **Excel / CSV export**
+  - Filter **All VDCs** → full inventory
+  - Filter **one VDC** → only vApps/VMs of that VDC
 
-## Konfiguration
+## Configuration
 
-Umgebungsvariablen in `docker-compose.yml`:
+Environment variables in `docker-compose.yml`:
 
-| Variable | Default | Beschreibung |
-|----------|---------|--------------|
-| `VCD_BASE_URL` | `https://portal.zibris-cloud.ch` | Cloud-Director-Portal |
-| `VCD_API_VERSION` | `39.1` | API-Version im `Accept`-Header |
-| `TZ` | `Europe/Zurich` | Zeitzone für den Zeitstempel „Stand“ |
-| `SESSION_SECRET` | `zibris-local-dev-secret-change-on-server` | Geheimnis für Session-Cookies – **auf dem Server ändern** |
-| `SESSION_HTTPS_ONLY` | `false` | Auf `true` setzen, wenn die App hinter HTTPS läuft |
-| `PORT` | `8080` | Port im Container (Mapping in Compose: `8080:8080`) |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VCD_BASE_URL` | `https://portal.zibris-cloud.ch` | Cloud Director portal |
+| `VCD_API_VERSION` | `39.1` | API version in the `Accept` header |
+| `TZ` | `Europe/Zurich` | Time zone for the “Stand” timestamp |
+| `SESSION_SECRET` | `zibris-local-dev-secret-change-on-server` | Secret for session cookies – **change on the server** |
+| `SESSION_HTTPS_ONLY` | `false` | Set to `true` when the app runs behind HTTPS |
+| `PORT` | `8080` | Port inside the container (Compose mapping: `8080:8080`) |
 
-Beispiel für einen Server mit HTTPS hinter Reverse Proxy:
+Example for a server with HTTPS behind a reverse proxy:
 
 ```yaml
 environment:
-  SESSION_SECRET: "langes-zufaelliges-geheimnis"
+  SESSION_SECRET: "long-random-secret"
   SESSION_HTTPS_ONLY: "true"
 ```
 
-## Architektur
+## Architecture
 
 ```
 Browser  →  FastAPI (Docker)  →  VMware Cloud Director API
                  │
                  ├─ Login: POST /cloudapi/1.0.0/sessions
-                 └─ Daten:  GET  /api/query (vApp / vm)
+                 └─ Data:  GET  /api/query (vApp / vm)
 ```
 
-Passwörter werden nicht dauerhaft gespeichert. Nach dem Login liegt das Inventory im Server-Speicher (Session); nach Container-Neustart ist ein erneuter Login nötig.
+Passwords are not stored permanently. After login, the inventory is kept in server memory (session); after a container restart, you must sign in again.
 
-## Projektstruktur
+## Project layout
 
 ```
 zibris-inventory-tool/
 ├── app/
-│   ├── main.py           # FastAPI-App, Login, Export
-│   ├── vcd_client.py     # Cloud-Director-Client
+│   ├── main.py           # FastAPI app, login, export
+│   ├── vcd_client.py     # Cloud Director client
 │   ├── templates/        # HTML
 │   └── static/           # CSS / JS
 ├── Dockerfile
@@ -103,12 +105,12 @@ zibris-inventory-tool/
 └── requirements.txt
 ```
 
-## Hinweise
+## Notes
 
-- Der User muss in Cloud Director **aktiviert** sein.
-- Templates werden bei VMs ausgefiltert (`isVAppTemplate==false`).
-- Healthcheck: `GET /healthz`
+- The user must be **enabled** in Cloud Director.
+- VM templates are filtered out (`isVAppTemplate==false`).
+- Health check: `GET /healthz`
 
-## Lizenz
+## License
 
-Intern / privat – nach Bedarf anpassen.
+Internal / private – adjust as needed.

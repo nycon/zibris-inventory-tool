@@ -124,7 +124,7 @@ def _fetch_inventory(
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> HTMLResponse:
-    # Immer Login-Formular zeigen – kein Auto-Restore der alten Session
+    # Always show the login form – do not auto-restore the previous session
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -270,7 +270,7 @@ def _filtered_inventory(
     vdc: str = "",
     status: str = "",
 ) -> list[dict[str, Any]]:
-    """Filter wie in der UI: VDC + Status (vApp und VMs)."""
+    """Same filters as the UI: VDC + status (vApp and VMs)."""
     vdc = (vdc or "").strip()
     status = (status or "").strip()
     result: list[dict[str, Any]] = []
@@ -281,9 +281,9 @@ def _filtered_inventory(
 
         vms = list(item.get("vms") or [])
         if status:
-            # Nur VMs mit passendem Status
+            # Keep only VMs with matching status
             vms = [vm for vm in vms if (vm.get("status") or "") == status]
-            # vApp nur behalten, wenn Status passt oder noch passende VMs da sind
+            # Keep vApp if its status matches or matching VMs remain
             vapp_ok = (item.get("status") or "") == status
             if not vapp_ok and not vms:
                 continue
@@ -337,7 +337,7 @@ def _inventory_totals(filtered: list[dict[str, Any]]) -> dict[str, float]:
     hdd = 0.0
     hdd_assigned = 0.0
     vms = 0
-    # Annahme: 1 externe IP pro VDC
+    # Assumption: 1 external IP per VDC
     ips = len({(item.get("vdc") or "").strip() for item in filtered if (item.get("vdc") or "").strip()})
     for item in filtered:
         vm_list = item.get("vms") or []
@@ -352,7 +352,7 @@ def _inventory_totals(filtered: list[dict[str, Any]]) -> dict[str, float]:
             ram += float(item.get("ram_gib") or 0)
             hdd += float(item.get("hdd_gib") or 0)
             hdd_assigned += float(item.get("hdd_assigned_gib") or 0)
-    # Kostenbasis HDD = zugewiesen, Fallback Verbrauch
+    # HDD cost base = assigned, fallback to used
     hdd_billable = hdd_assigned if hdd_assigned > 0 else hdd
     return {
         "vapps": float(len(filtered)),
@@ -376,7 +376,7 @@ def _cost_summary(
     include_edge: bool = False,
 ) -> dict[str, Any]:
     totals = _inventory_totals(filtered)
-    # Edge GW optional: 1 pro VDC wenn aktiviert
+    # Optional Edge GW: 1 per VDC when enabled
     edges = totals["ips"] if include_edge else 0.0
     cost_cpu = totals["cpu"] * price_cpu
     cost_ram = totals["ram_gib"] * price_ram
@@ -575,7 +575,7 @@ async def export_xlsx(
         ws.auto_filter.ref = f"A1:P{data_end}"
     ws.freeze_panes = "A2"
 
-    # Kostenblock unten
+    # Cost block at the bottom
     start = data_end + 2
     section_fill = PatternFill("solid", fgColor="0F3D3E")
     section_font = Font(color="F4F7F5", bold=True)

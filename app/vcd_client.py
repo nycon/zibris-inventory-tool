@@ -106,7 +106,7 @@ class VcdClient:
     def vm_disk_capacity_mb(
         self, vm_href: str, client: httpx.Client | None = None
     ) -> tuple[float, int, list[dict[str, Any]]]:
-        """Summe + Anzahl + Einzel-Disks (konfigurierte Kapazitäten)."""
+        """Total + count + individual disks (configured capacities)."""
         if not vm_href:
             return 0.0, 0, []
         url = f"{vm_href.rstrip('/')}/virtualHardwareSection/disks"
@@ -145,7 +145,7 @@ class VcdClient:
                 http.close()
 
     def enrich_assigned_disks(self, inventory: list[dict], max_workers: int = 16) -> list[dict]:
-        """HDD konfig. = Summe + Liste aller Festplatten pro VM."""
+        """Configured HDD = sum + list of all disks per VM."""
         targets: list[dict] = []
         for vapp in inventory:
             for vm in vapp.get("vms") or []:
@@ -201,7 +201,7 @@ class VcdClient:
             vapp["hdd_assigned_from_api"] = any(
                 vm.get("hdd_assigned_from_api") for vm in (vapp.get("vms") or [])
             )
-            # vApp-Diskliste = alle VM-Disks flach
+            # vApp disk list = all VM disks flattened
             vapp_disks: list[dict[str, Any]] = []
             for vm in vapp.get("vms") or []:
                 for d in vm.get("hdd_disks") or []:
@@ -215,7 +215,7 @@ class VcdClient:
             vapp["hdd_disks"] = vapp_disks
 
         print(
-            f"[zibris] HDD konfig.: {api_ok}/{len(targets)} VMs via Disk-API; "
+            f"[zibris] HDD configured: {api_ok}/{len(targets)} VMs via disk API; "
             f"Disk-Anzahlen={dict(Counter(len((vm.get('hdd_disks') or [])) for v in inventory for vm in (v.get('vms') or [])))}",
             flush=True,
         )
@@ -238,7 +238,7 @@ def _as_float(value: Any) -> float:
 
 
 def _capacity_from_host_resource(host: Any) -> float:
-    """Extrahiert capacity (MB) aus HostResource (dict, list oder str)."""
+    """Extract capacity (MB) from HostResource (dict, list, or str)."""
     if host is None:
         return 0.0
     if isinstance(host, list):
@@ -278,14 +278,14 @@ def _capacity_from_host_resource(host: Any) -> float:
 
 
 def _disk_capacity_mb_from_item(item: dict[str, Any]) -> float:
-    """Kapazität einer Hard Disk (ResourceType 17) in MB."""
-    # 1) HostResource capacity ist die konfigurierte Größe in MB (pro Disk)
+    """Capacity of a hard disk (ResourceType 17) in MB."""
+    # 1) HostResource capacity is the configured size in MB (per disk)
     host = item.get("hostResource") or item.get("HostResource")
     cap = _capacity_from_host_resource(host)
     if cap > 0:
         return cap
 
-    # 2) VirtualQuantity (meist Bytes)
+    # 2) VirtualQuantity (usually bytes)
     qty = _as_float(item.get("virtualQuantity") or item.get("VirtualQuantity"))
     units = str(
         item.get("virtualQuantityUnits") or item.get("VirtualQuantityUnits") or "byte"
@@ -367,7 +367,7 @@ def _parse_disks_from_xml(text: str) -> list[dict[str, Any]]:
         return []
     disks: list[dict[str, Any]] = []
     idx = 1
-    # Namespace-Präfixe: <Item>, <rasd:Item>, <ovf:Item>, …
+    # Namespace prefixes: <Item>, <rasd:Item>, <ovf:Item>, …
     item_blocks = re.findall(
         r"<(?:\w+:)?Item\b[\s\S]*?</(?:\w+:)?Item>",
         text,
@@ -436,7 +436,7 @@ def _apply_assigned_fallback(inventory: list[dict]) -> None:
     for vapp in inventory:
         assigned_total = 0.0
         for vm in vapp.get("vms") or []:
-            # hdd_mib ist bereits ohne RAM
+            # hdd_mib is already without RAM
             mb = max(0.0, float(vm.get("hdd_mib") or 0))
             vm["hdd_assigned_mib"] = int(round(mb)) if mb else 0
             vm["hdd_assigned_gib"] = mib_to_gib(mb)
@@ -456,10 +456,9 @@ def normalize_inventory(
     for vm in vms:
         total_mib = float(vm.get("totalStorageAllocatedMb") or 0)
         ram_mib = float(vm.get("memoryMB") or 0)
-        # VCD: totalStorageAllocatedMb = Disks + Snapshots + Memory → RAM rausrechnen
+        # VCD: totalStorageAllocatedMb = disks + snapshots + memory → subtract RAM
         hdd_used_mib = max(0.0, total_mib - ram_mib)
-        # Sofortiger Näherungswert für zugewiesen – bewusst 0, bis Disk-API kommt
-        # (sonst sind zug/verb immer identisch und wirken wie ein Bug)
+        # Placeholder for assigned until disk API runs (keep 0 so assigned ≠ used)
         assigned_mib = 0.0
         item = {
             "name": vm.get("name") or "-",
@@ -470,7 +469,7 @@ def normalize_inventory(
             "cpu": int(vm.get("numberOfCpus") or 0),
             "ram_mib": int(ram_mib) if ram_mib else 0,
             "ram_gib": mib_to_gib(ram_mib),
-            # HDD allokiert ohne RAM (VCD); kann Snapshots enthalten
+            # Allocated HDD without RAM (VCD); may include snapshots
             "hdd_mib": int(round(hdd_used_mib)) if hdd_used_mib else 0,
             "hdd_gib": mib_to_gib(hdd_used_mib),
             "hdd_assigned_mib": 0,
@@ -495,11 +494,11 @@ def normalize_inventory(
             children = list(by_name.get(vapp.get("name") or "", []))
         total_mib = float(vapp.get("totalStorageAllocatedMb") or 0)
         ram_mib = float(vapp.get("memoryAllocationMB") or 0)
-        # vApp-Gesamt enthält ebenfalls Memory → für HDD herausrechnen
+        # vApp total also includes memory → subtract for HDD
         hdd_used_from_vapp = max(0.0, total_mib - ram_mib)
         hdd_used_from_vms = sum(float(c.get("hdd_mib") or 0) for c in children)
         hdd_used_mib = hdd_used_from_vms if children else hdd_used_from_vapp
-        # Kein Fallback auf allokierte HDD – sonst denkt die UI, Disk-Details seien schon da
+        # No fallback to allocated HDD – otherwise UI thinks disk details are ready
         assigned_mib = sum(float(c.get("hdd_assigned_mib") or 0) for c in children)
         inventory.append(
             {
