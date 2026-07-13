@@ -66,7 +66,7 @@ Umgebungsvariablen in `docker-compose.yml`:
 | `VCD_BASE_URL` | `https://portal.zibris-cloud.ch` | Cloud-Director-Portal |
 | `VCD_API_VERSION` | `39.1` | API-Version im `Accept`-Header |
 | `TZ` | `Europe/Zurich` | Zeitzone für den Zeitstempel „Stand“ |
-| `SESSION_SECRET` | (Dev-Wert) | Geheimnis für Session-Cookies – **auf dem Server ändern** |
+| `SESSION_SECRET` | `zibris-local-dev-secret-change-on-server` | Geheimnis für Session-Cookies – **auf dem Server ändern** |
 | `SESSION_HTTPS_ONLY` | `false` | Auf `true` setzen, wenn die App hinter HTTPS läuft |
 | `PORT` | `8080` | Port im Container (Mapping in Compose: `8080:8080`) |
 
