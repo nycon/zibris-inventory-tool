@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Zibris Cloud · Inventory</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css?v=28" />
+</head>
+<body>
+  <div class="bg-glow" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">Z</span>
+      <div>
+        <div class="brand-name">Zibris Cloud</div>
+        <div class="brand-sub">vApp &amp; VM Inventory</div>
+      </div>
+    </div>
+    <div class="top-actions" id="top-actions" hidden>
+      <button type="button" class="btn ghost" id="btn-refresh">Aktualisieren</button>
+      <div class="export-group">
+        <a class="btn ghost" id="btn-csv" href="/api/export.csv">CSV</a>
+        <a class="btn primary" id="btn-xlsx" href="/api/export.xlsx">Excel</a>
+        <button type="button" class="btn ghost" id="btn-calc" aria-expanded="false">VM Berechnung</button>
+      </div>
+      <button type="button" class="btn ghost danger" id="btn-logout">Logout</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel login-panel" id="login-panel">
+      <div class="login-card">
+        <p class="eyebrow">Cloud Director</p>
+        <h1>Inventory öffnen</h1>
+        <p class="lede">Melde dich mit deinem Org-User an. Danach siehst du alle vApps mit CPU, RAM und HDD.</p>
+
+        <form id="login-form" autocomplete="on">
+          <label>
+            <span>Portal URL</span>
+            <input name="base_url" type="url" value="{{ default_base_url }}" required />
+          </label>
+          <div class="grid-2">
+            <label>
+              <span>Benutzer</span>
+              <input name="username" type="text" value="{{ username }}" placeholder="zibris-user" required />
+            </label>
+            <label>
+              <span>Organisation</span>
+              <input name="org" type="text" value="{{ org }}" placeholder="swisspro" required />
+            </label>
+          </div>
+          <label>
+            <span>Passwort</span>
+            <input name="password" type="password" required />
+          </label>
+          <button class="btn primary wide" type="submit" id="btn-login">Anmelden &amp; laden</button>
+          <p class="form-error" id="login-error" hidden></p>
+        </form>
+      </div>
+    </section>
+
+    <section class="panel app-panel" id="app-panel" hidden>
+      <div class="stats" id="stats">
+        <div class="stat"><span class="stat-label">vApps</span><strong id="stat-vapps">—</strong></div>
+        <div class="stat"><span class="stat-label">VMs</span><strong id="stat-vms">—</strong></div>
+        <div class="stat"><span class="stat-label">CPU</span><strong id="stat-cpu">—</strong></div>
+        <div class="stat"><span class="stat-label">RAM</span><strong id="stat-ram">—</strong></div>
+        <div class="stat" id="stat-hdd-assigned-wrap" hidden>
+          <span class="stat-label">HDD konfig.</span><strong id="stat-hdd-assigned">—</strong>
+        </div>
+        <div class="stat"><span class="stat-label">HDD allok.</span><strong id="stat-storage">—</strong></div>
+        <div class="stat wide"><span class="stat-label">Stand</span><strong id="stat-at">—</strong></div>
+      </div>
+
+      <div class="calc-panel" id="calc-panel" hidden>
+        <div class="calc-head">
+          <div>
+            <p class="eyebrow">Kostenrechner</p>
+            <h2>VM Berechnung</h2>
+            <p class="calc-hint">Preise eintragen – Total bezieht sich auf den aktuellen Filter (VDC, Status, Suche).</p>
+          </div>
+          <div class="calc-total-box">
+            <span class="stat-label">Gesamtkosten</span>
+            <strong id="calc-total">CHF 0.00</strong>
+            <span class="calc-scope" id="calc-scope">alle VDCs</span>
+          </div>
+        </div>
+        <div class="calc-grid">
+          <label>
+            <span>Preis CPU <em>(CHF / vCPU)</em></span>
+            <input type="number" id="price-cpu" min="0" step="0.01" placeholder="0.00" inputmode="decimal" />
+          </label>
+          <label>
+            <span>Preis RAM <em>(CHF / GiB)</em></span>
+            <input type="number" id="price-ram" min="0" step="0.01" placeholder="0.00" inputmode="decimal" />
+          </label>
+          <label>
+            <span>Preis HDD <em>(CHF / GiB konfiguriert)</em></span>
+            <input type="number" id="price-hdd" min="0" step="0.01" placeholder="0.00" inputmode="decimal" />
+          </label>
+          <label>
+            <span>Preis IP <em>(CHF / VDC)</em></span>
+            <input type="number" id="price-ip" min="0" step="0.01" placeholder="0.00" inputmode="decimal" />
+          </label>
+        </div>
+        <div class="calc-breakdown">
+          <div class="calc-line"><span>CPU</span><strong id="calc-cpu">CHF 0.00</strong><em id="calc-cpu-qty">0 vCPU</em></div>
+          <div class="calc-line"><span>RAM</span><strong id="calc-ram">CHF 0.00</strong><em id="calc-ram-qty">0 GiB</em></div>
+          <div class="calc-line"><span>HDD konfig.</span><strong id="calc-hdd">CHF 0.00</strong><em id="calc-hdd-qty">0 GiB</em></div>
+          <div class="calc-line"><span>IP</span><strong id="calc-ip">CHF 0.00</strong><em id="calc-ip-qty">0 × VDC</em></div>
+        </div>
+        <div class="calc-edge">
+          <label class="check edge-check">
+            <input type="checkbox" id="include-edge" />
+            <span>Edge Gateway einbeziehen <em>(1 × pro VDC)</em></span>
+          </label>
+          <label class="edge-price">
+            <span>Preis Edge GW <em>(CHF)</em></span>
+            <input type="number" id="price-edge" min="0" step="0.01" placeholder="0.00" inputmode="decimal" />
+          </label>
+          <div class="calc-line edge-line">
+            <span>Edge GW</span>
+            <strong id="calc-edge">CHF 0.00</strong>
+            <em id="calc-edge-qty">nicht gewählt</em>
+          </div>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <input type="search" id="search" placeholder="Suche nach Name, VDC, OS…" />
+        <select id="filter-status">
+          <option value="">Alle Status</option>
+          <option value="POWERED_ON">Powered On</option>
+          <option value="POWERED_OFF">Powered Off</option>
+          <option value="SUSPENDED">Suspended</option>
+          <option value="RESOLVED">Resolved</option>
+        </select>
+        <select id="filter-vdc" title="Filtert die Liste und den Excel/CSV-Export">
+          <option value="">Alle VDCs</option>
+        </select>
+        <button
+          type="button"
+          class="btn ghost"
+          id="btn-hdd-assigned"
+          aria-pressed="false"
+          title="Konfigurierte Disk-Größen nachladen und anzeigen"
+        >
+          HDD konfig.
+        </button>
+      </div>
+
+      <div class="table-wrap">
+        <table class="inventory" id="inventory-table">
+          <thead>
+            <tr>
+              <th></th>
+              <th>vApp</th>
+              <th>Status</th>
+              <th>VDC</th>
+              <th class="num">CPU</th>
+              <th class="num">RAM</th>
+              <th class="num col-hdd-assigned" title="Summe der konfigurierten Festplatten" hidden>HDD konfig.</th>
+              <th class="num" title="VCD-Allokation ohne RAM (Disks + ggf. Snapshots)">HDD allok.</th>
+              <th class="num">VMs</th>
+            </tr>
+          </thead>
+          <tbody id="inventory-body"></tbody>
+        </table>
+      </div>
+      <p class="empty" id="empty-state" hidden>Keine Treffer für den aktuellen Filter.</p>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" hidden></div>
+  <div class="loading" id="loading" hidden>
+    <div class="spinner"></div>
+    <p id="loading-text">Anmelden…</p>
+  </div>
+
+  <script src="/static/app.js?v=27"></script>
+</body>
+</html>

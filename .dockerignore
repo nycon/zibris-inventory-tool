@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.DS_Store
+*.xlsx
+*.csv
+.env
+*.md
+scripts/
+terminals/
+.cursor/

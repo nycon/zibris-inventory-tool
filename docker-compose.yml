@@ -1,0 +1,14 @@
+services:
+  zibris-vcd:
+    build: .
+    image: zibris-vcd-inventory:latest
+    container_name: zibris-vcd-inventory
+    ports:
+      - "8080:8080"
+    environment:
+      VCD_BASE_URL: https://portal.zibris-cloud.ch
+      VCD_API_VERSION: "39.1"
+      TZ: Europe/Zurich
+      SESSION_SECRET: zibris-local-dev-secret-change-on-server
+      SESSION_HTTPS_ONLY: "false"
+    restart: unless-stopped
