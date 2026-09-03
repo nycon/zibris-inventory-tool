@@ -2,11 +2,32 @@
 
 from __future__ import annotations
 
+import re
+import xml.etree.ElementTree as ET
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional
 
 import httpx
+
+_METRIC_NAMES_USED = {"disk.used.latest", "disk.used"}
+_METRIC_NAMES_PROV = {"disk.provisioned.latest", "disk.provisioned"}
+_METRIC_SAMPLE_LOGGED = False
+
+
+def _is_used_metric_name(name: str) -> bool:
+    key = (name or "").strip().lower()
+    if key in _METRIC_NAMES_USED:
+        return True
+    # per-disk variants e.g. disk.used.latest.0
+    return key.startswith("disk.used.latest") or key.startswith("disk.used.")
+
+
+def _is_prov_metric_name(name: str) -> bool:
+    key = (name or "").strip().lower()
+    if key in _METRIC_NAMES_PROV:
+        return True
+    return key.startswith("disk.provisioned.latest") or key.startswith("disk.provisioned.")
 
 
 class VcdError(Exception):
@@ -144,8 +165,103 @@ class VcdClient:
             if owns:
                 http.close()
 
+    def vm_disk_usage_metrics(
+        self, vm_href: str, client: httpx.Client | None = None
+    ) -> dict[str, Any]:
+        """Fetch disk.used / disk.provisioned from VM current metrics (if enabled)."""
+        empty = {
+            "ok": False,
+            "status_code": 0,
+            "used_kib": None,
+            "provisioned_kib": None,
+            "detail": "",
+            "metric_names": [],
+        }
+        if not vm_href:
+            return empty
+        url = f"{vm_href.rstrip('/')}/metrics/current"
+        owns = client is None
+        http = client or httpx.Client(timeout=min(self.timeout, 45.0), verify=True)
+
+        def _names_from_body(text: str) -> list[str]:
+            names = re.findall(r'\bname\s*=\s*"([^"]+)"', text or "", flags=re.I)
+            if not names:
+                names = re.findall(r'"name"\s*:\s*"([^"]+)"', text or "", flags=re.I)
+            # unique, keep order
+            seen: set[str] = set()
+            out: list[str] = []
+            for n in names:
+                if n not in seen:
+                    seen.add(n)
+                    out.append(n)
+            return out
+
+        try:
+            headers_xml = {
+                "Authorization": f"Bearer {self.token}",
+                "Accept": f"application/*+xml;version={self.api_version}",
+            }
+            resp = http.get(url, headers=headers_xml)
+            if resp.status_code == 200 and resp.text:
+                parsed = _parse_disk_metrics(resp.text, resp.headers.get("content-type", ""))
+                if parsed.get("used_kib") is not None or parsed.get("provisioned_kib") is not None:
+                    parsed["ok"] = True
+                    parsed["status_code"] = resp.status_code
+                    parsed["metric_names"] = _names_from_body(resp.text)
+                    return parsed
+
+                headers_json = {
+                    "Authorization": f"Bearer {self.token}",
+                    "Accept": f"application/*+json;version={self.api_version}",
+                }
+                resp_j = http.get(url, headers=headers_json)
+                if resp_j.status_code == 200 and resp_j.text:
+                    try:
+                        parsed_j = _parse_disk_metrics(
+                            resp_j.text, resp_j.headers.get("content-type", "application/json")
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        parsed_j = {"used_kib": None, "provisioned_kib": None, "detail": str(exc)}
+                    if (
+                        parsed_j.get("used_kib") is not None
+                        or parsed_j.get("provisioned_kib") is not None
+                    ):
+                        parsed_j["ok"] = True
+                        parsed_j["status_code"] = resp_j.status_code
+                        parsed_j["metric_names"] = _names_from_body(resp_j.text)
+                        return parsed_j
+                    names = _names_from_body(resp.text) or _names_from_body(resp_j.text)
+                    sample = re.sub(r"\s+", " ", resp.text)[:500]
+                    return {
+                        **empty,
+                        "status_code": 200,
+                        "metric_names": names,
+                        "detail": f"no disk used/prov; names={names[:30]}; sample={sample}",
+                    }
+
+                names = _names_from_body(resp.text)
+                sample = re.sub(r"\s+", " ", resp.text)[:500]
+                return {
+                    **empty,
+                    "status_code": 200,
+                    "metric_names": names,
+                    "detail": f"no disk used/prov; names={names[:30]}; sample={sample}",
+                }
+
+            body = (resp.text or "")[:300]
+            return {
+                **empty,
+                "status_code": resp.status_code,
+                "detail": body or f"HTTP {resp.status_code}",
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {**empty, "detail": str(exc)}
+        finally:
+            if owns:
+                http.close()
+
     def enrich_assigned_disks(self, inventory: list[dict], max_workers: int = 16) -> list[dict]:
-        """Configured HDD = sum + list of all disks per VM."""
+        """Configured HDD + optional datastore 'in use' metrics per VM."""
         targets: list[dict] = []
         for vapp in inventory:
             for vm in vapp.get("vms") or []:
@@ -157,29 +273,43 @@ class VcdClient:
                     vm["hdd_assigned_from_api"] = False
                     vm["hdd_disk_count"] = 0
                     vm["hdd_disks"] = []
+                    vm["hdd_used_from_api"] = False
+                    vm["hdd_used_mib"] = 0
+                    vm["hdd_used_gib"] = 0.0
             return inventory
 
-        def _one(vm: dict) -> tuple[str, float, int, list[dict[str, Any]]]:
+        def _one(
+            vm: dict,
+        ) -> tuple[str, float, int, list[dict[str, Any]], dict[str, Any]]:
             with httpx.Client(timeout=min(self.timeout, 45.0), verify=True) as client:
-                mb, count, disks = self.vm_disk_capacity_mb(vm.get("href") or "", client=client)
-            return vm.get("href") or "", mb, count, disks
+                href = vm.get("href") or ""
+                mb, count, disks = self.vm_disk_capacity_mb(href, client=client)
+                metrics = self.vm_disk_usage_metrics(href, client=client)
+            return href, mb, count, disks, metrics
 
-        by_href: dict[str, tuple[float, int, list[dict[str, Any]]]] = {}
+        by_href: dict[str, tuple[float, int, list[dict[str, Any]], dict[str, Any]]] = {}
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [pool.submit(_one, vm) for vm in targets]
             for fut in as_completed(futures):
                 try:
-                    href, mb, count, disks = fut.result()
+                    href, mb, count, disks, metrics = fut.result()
                 except Exception:  # noqa: BLE001
                     continue
                 if href:
-                    by_href[href] = (mb, count, disks)
+                    by_href[href] = (mb, count, disks, metrics)
 
         api_ok = 0
+        used_ok = 0
+        metric_status: Counter[str] = Counter()
         for vapp in inventory:
             assigned_total = 0.0
+            used_total = 0.0
+            used_any = False
             for vm in vapp.get("vms") or []:
-                mb, count, disks = by_href.get(vm.get("href") or "", (0.0, 0, []))
+                mb, count, disks, metrics = by_href.get(
+                    vm.get("href") or "",
+                    (0.0, 0, [], {"ok": False, "status_code": 0, "detail": "missing"}),
+                )
                 from_api = mb > 0 and bool(disks)
                 if from_api:
                     api_ok += 1
@@ -195,12 +325,34 @@ class VcdClient:
                 vm["hdd_assigned_mib"] = int(round(mb)) if mb else 0
                 vm["hdd_assigned_gib"] = mib_to_gib(mb)
                 assigned_total += mb
+
+                used_kib = metrics.get("used_kib") if isinstance(metrics, dict) else None
+                metric_status[str(metrics.get("status_code") or metrics.get("detail") or "?")] += 1
+                if metrics.get("ok") and used_kib is not None:
+                    used_mib = float(used_kib) / 1024.0
+                    vm["hdd_used_from_api"] = True
+                    vm["hdd_used_mib"] = int(round(used_mib)) if used_mib else 0
+                    vm["hdd_used_gib"] = mib_to_gib(used_mib)
+                    used_ok += 1
+                    used_any = True
+                    used_total += used_mib
+                else:
+                    vm["hdd_used_from_api"] = False
+                    vm["hdd_used_mib"] = 0
+                    vm["hdd_used_gib"] = 0.0
+                    vm["hdd_used_error"] = (
+                        f"HTTP {metrics.get('status_code')}: {metrics.get('detail') or ''}"
+                    )[:180]
+
             vapp["hdd_assigned_mib"] = int(round(assigned_total)) if assigned_total else 0
             vapp["hdd_assigned_gib"] = mib_to_gib(assigned_total)
             vapp["hdd_disk_count"] = sum(int(vm.get("hdd_disk_count") or 0) for vm in (vapp.get("vms") or []))
             vapp["hdd_assigned_from_api"] = any(
                 vm.get("hdd_assigned_from_api") for vm in (vapp.get("vms") or [])
             )
+            vapp["hdd_used_from_api"] = used_any
+            vapp["hdd_used_mib"] = int(round(used_total)) if used_any else 0
+            vapp["hdd_used_gib"] = mib_to_gib(used_total) if used_any else 0.0
             # vApp disk list = all VM disks flattened
             vapp_disks: list[dict[str, Any]] = []
             for vm in vapp.get("vms") or []:
@@ -216,9 +368,35 @@ class VcdClient:
 
         print(
             f"[zibris] HDD configured: {api_ok}/{len(targets)} VMs via disk API; "
+            f"HDD in use (metrics): {used_ok}/{len(targets)}; "
+            f"metric_status={dict(metric_status)}; "
             f"Disk-Anzahlen={dict(Counter(len((vm.get('hdd_disks') or [])) for v in inventory for vm in (v.get('vms') or [])))}",
             flush=True,
         )
+        if used_ok == 0:
+            # Log one sample error so we can see metric names / response shape
+            sample_detail = ""
+            sample_names: list[str] = []
+            for vapp in inventory:
+                for vm in vapp.get("vms") or []:
+                    if vm.get("hdd_used_error"):
+                        sample_detail = str(vm.get("hdd_used_error"))
+                        break
+                if sample_detail:
+                    break
+            # Pull names from first cached metrics via by_href
+            for _href, payload in by_href.items():
+                metrics = payload[3] if len(payload) > 3 else {}
+                if isinstance(metrics, dict) and metrics.get("detail"):
+                    sample_detail = sample_detail or str(metrics.get("detail"))
+                    sample_names = list(metrics.get("metric_names") or [])
+                    break
+            print(
+                f"[zibris] HDD in use sample: names={sample_names}; detail={sample_detail[:600]}",
+                flush=True,
+            )
+        for vapp in inventory:
+            vapp["hdd_metrics_checked"] = True
         return inventory
 
 
@@ -227,8 +405,158 @@ def mib_to_gib(value: Any) -> float:
         n = float(value or 0)
     except (TypeError, ValueError):
         return 0.0
-    return round(n / 1024, 1) if n else 0.0
+    return round(n / 1024.0, 1)
 
+
+def _metric_to_kib(name: str, unit: str, value: Any) -> tuple[str, float] | None:
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
+        return None
+    u = (unit or "").strip().lower()
+    if u in {"kilobyte", "kilobytes", "kb", "kib"}:
+        kib = raw
+    elif u in {"megabyte", "megabytes", "mb", "mib"}:
+        kib = raw * 1024.0
+    elif u in {"gigabyte", "gigabytes", "gb", "gib"}:
+        kib = raw * 1024.0 * 1024.0
+    elif u in {"byte", "bytes", "b"}:
+        kib = raw / 1024.0
+    else:
+        # VCD docs: disk.*.latest is KILOBYTE; assume KB if unit missing
+        kib = raw
+    key = (name or "").strip().lower()
+    # Zibris/VCD often returns per-disk series: disk.used.latest.0, .1, …
+    if key in _METRIC_NAMES_USED or key.startswith("disk.used.latest"):
+        return "used_kib", kib
+    if key in _METRIC_NAMES_PROV or key.startswith("disk.provisioned.latest"):
+        return "provisioned_kib", kib
+    if key.startswith("disk.used"):
+        return "used_kib", kib
+    if key.startswith("disk.provisioned"):
+        return "provisioned_kib", kib
+    return None
+
+
+def _parse_disk_metrics_json(data: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {"used_kib": None, "provisioned_kib": None, "detail": ""}
+    metrics: list[Any] = []
+    if isinstance(data, dict):
+        for key in ("metric", "Metric", "metrics", "MetricValues", "values"):
+            val = data.get(key)
+            if isinstance(val, list):
+                metrics = val
+                break
+            if isinstance(val, dict):
+                metrics = [val]
+                break
+        if not metrics and "name" in data:
+            metrics = [data]
+    elif isinstance(data, list):
+        metrics = data
+
+    used_sum = 0.0
+    prov_sum = 0.0
+    used_any = False
+    prov_any = False
+    for item in metrics:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("Name") or "")
+        unit = str(item.get("unit") or item.get("Unit") or "")
+        value = item.get("value", item.get("Value"))
+        mapped = _metric_to_kib(name, unit, value)
+        if not mapped:
+            continue
+        if mapped[0] == "used_kib":
+            used_sum += mapped[1]
+            used_any = True
+        elif mapped[0] == "provisioned_kib":
+            prov_sum += mapped[1]
+            prov_any = True
+    if used_any:
+        out["used_kib"] = used_sum
+    if prov_any:
+        out["provisioned_kib"] = prov_sum
+    return out
+
+
+def _parse_disk_metrics(body: str, content_type: str = "") -> dict[str, Any]:
+    """Parse metrics XML or JSON body for disk used/provisioned."""
+    ct = (content_type or "").lower()
+    text = (body or "").strip()
+    if not text:
+        return {"used_kib": None, "provisioned_kib": None, "detail": "empty"}
+
+    if "json" in ct or text.startswith("{") or text.startswith("["):
+        try:
+            import json
+
+            return _parse_disk_metrics_json(json.loads(text))
+        except Exception as exc:  # noqa: BLE001
+            return {"used_kib": None, "provisioned_kib": None, "detail": str(exc)}
+
+    out: dict[str, Any] = {"used_kib": None, "provisioned_kib": None, "detail": ""}
+    used_sum = 0.0
+    prov_sum = 0.0
+    used_any = False
+    prov_any = False
+
+    def _accumulate(name: str, unit: str, value: Any) -> None:
+        nonlocal used_sum, prov_sum, used_any, prov_any
+        mapped = _metric_to_kib(name, unit, value)
+        if not mapped:
+            return
+        if mapped[0] == "used_kib":
+            used_sum += mapped[1]
+            used_any = True
+        elif mapped[0] == "provisioned_kib":
+            prov_sum += mapped[1]
+            prov_any = True
+
+    # Attribute form: <Metric name="disk.used.latest.0" unit="KILOBYTE" value="123"/>
+    for m in re.finditer(
+        r'<(?:[\w.-]+:)?Metric\b([^>]*)/?>',
+        text,
+        flags=re.IGNORECASE,
+    ):
+        attrs = m.group(1)
+        name_m = re.search(r'\bname\s*=\s*"([^"]+)"', attrs, flags=re.I)
+        unit_m = re.search(r'\bunit\s*=\s*"([^"]+)"', attrs, flags=re.I)
+        value_m = re.search(r'\bvalue\s*=\s*"([^"]+)"', attrs, flags=re.I)
+        if not name_m or not value_m:
+            continue
+        _accumulate(
+            name_m.group(1),
+            unit_m.group(1) if unit_m else "",
+            value_m.group(1),
+        )
+
+    if used_any or prov_any:
+        if used_any:
+            out["used_kib"] = used_sum
+        if prov_any:
+            out["provisioned_kib"] = prov_sum
+        return out
+
+    # ElementTree fallback (namespaced)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return out
+    for el in root.iter():
+        tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+        if tag.lower() != "metric":
+            continue
+        name = el.attrib.get("name") or el.attrib.get("Name") or ""
+        unit = el.attrib.get("unit") or el.attrib.get("Unit") or ""
+        value = el.attrib.get("value") or el.attrib.get("Value") or (el.text or "")
+        _accumulate(name, unit, value)
+    if used_any:
+        out["used_kib"] = used_sum
+    if prov_any:
+        out["provisioned_kib"] = prov_sum
+    return out
 
 def _as_float(value: Any) -> float:
     try:
@@ -475,6 +803,9 @@ def normalize_inventory(
             "hdd_assigned_mib": 0,
             "hdd_assigned_gib": 0.0,
             "hdd_assigned_from_api": False,
+            "hdd_used_mib": 0,
+            "hdd_used_gib": 0.0,
+            "hdd_used_from_api": False,
             "hdd_disk_count": 0,
             "hdd_disks": [],
             "network": vm.get("networkName") or "—",
@@ -513,6 +844,9 @@ def normalize_inventory(
                 "hdd_assigned_mib": int(round(assigned_mib)) if assigned_mib else 0,
                 "hdd_assigned_gib": mib_to_gib(assigned_mib),
                 "hdd_assigned_from_api": False,
+                "hdd_used_mib": 0,
+                "hdd_used_gib": 0.0,
+                "hdd_used_from_api": False,
                 "hdd_disks": [],
                 "vm_count": len(children),
                 "href": vapp.get("href") or "",
@@ -532,6 +866,11 @@ def flatten_rows(inventory: list[dict]) -> list[dict]:
             parts.append(f"{d.get('name')}: {d.get('gib')} GiB")
         return "; ".join(parts)
 
+    def _used_export(obj: dict) -> Any:
+        if obj.get("hdd_used_from_api"):
+            return obj.get("hdd_used_gib") or 0
+        return ""
+
     for vapp in inventory:
         if not vapp["vms"]:
             rows.append(
@@ -539,18 +878,14 @@ def flatten_rows(inventory: list[dict]) -> list[dict]:
                     "vapp": vapp["name"],
                     "vapp_status": vapp["status"],
                     "vdc": vapp["vdc"],
-                    "vapp_cpu": vapp["cpu"],
-                    "vapp_ram_gib": vapp["ram_gib"],
-                    "vapp_hdd_assigned_gib": vapp.get("hdd_assigned_gib") or 0,
-                    "vapp_hdd_gib": vapp["hdd_gib"],
                     "vm": "",
                     "vm_status": "",
                     "os": "",
-                    "cpu": "",
-                    "ram_gib": "",
-                    "hdd_assigned_gib": "",
-                    "hdd_disks": "",
-                    "hdd_gib": "",
+                    "cpu": vapp.get("cpu") or "",
+                    "ram_gib": vapp.get("ram_gib") or "",
+                    "hdd_assigned_gib": vapp.get("hdd_assigned_gib") or 0,
+                    "hdd_disks": _disks_label(vapp.get("hdd_disks")),
+                    "hdd_used_gib": _used_export(vapp),
                     "network": "",
                 }
             )
@@ -561,10 +896,6 @@ def flatten_rows(inventory: list[dict]) -> list[dict]:
                     "vapp": vapp["name"],
                     "vapp_status": vapp["status"],
                     "vdc": vapp["vdc"],
-                    "vapp_cpu": vapp["cpu"],
-                    "vapp_ram_gib": vapp["ram_gib"],
-                    "vapp_hdd_assigned_gib": vapp.get("hdd_assigned_gib") or 0,
-                    "vapp_hdd_gib": vapp["hdd_gib"],
                     "vm": vm["name"],
                     "vm_status": vm["status"],
                     "os": vm["os"],
@@ -572,7 +903,7 @@ def flatten_rows(inventory: list[dict]) -> list[dict]:
                     "ram_gib": vm["ram_gib"],
                     "hdd_assigned_gib": vm.get("hdd_assigned_gib") or 0,
                     "hdd_disks": _disks_label(vm.get("hdd_disks")),
-                    "hdd_gib": vm["hdd_gib"],
+                    "hdd_used_gib": _used_export(vm),
                     "network": vm["network"] if vm["network"] != "—" else "",
                 }
             )

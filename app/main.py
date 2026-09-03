@@ -209,11 +209,15 @@ async def logout(request: Request) -> dict[str, bool]:
 def _inventory_has_disk_api(inventory: list[dict[str, Any]] | None) -> bool:
     if not inventory:
         return False
+    has_disks = False
+    has_metrics_pass = False
     for vapp in inventory:
+        if vapp.get("hdd_metrics_checked"):
+            has_metrics_pass = True
         for vm in vapp.get("vms") or []:
             if vm.get("hdd_assigned_from_api") and (vm.get("hdd_disks") or []):
-                return True
-    return False
+                has_disks = True
+    return has_disks and has_metrics_pass
 
 
 @app.get("/api/inventory")
@@ -265,6 +269,69 @@ async def get_inventory(
     }
 
 
+@app.get("/api/debug/disk-metrics")
+async def debug_disk_metrics(request: Request, vdc: str = "", limit: int = 10) -> dict[str, Any]:
+    """Probe VCD metrics for a few VMs (HDD in use). Requires active login session."""
+    client = _session_client(request)
+    cached = _get_cached_inventory(request)
+    if cached is None:
+        raise HTTPException(status_code=400, detail="Kein Inventory geladen – bitte neu anmelden.")
+
+    filtered = _filtered_inventory(cached, vdc=vdc)
+    samples: list[dict[str, Any]] = []
+    for vapp in filtered:
+        for vm in vapp.get("vms") or []:
+            if not vm.get("href"):
+                continue
+            samples.append(vm)
+            if len(samples) >= max(1, min(limit, 50)):
+                break
+        if len(samples) >= max(1, min(limit, 50)):
+            break
+
+    def _probe() -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for vm in samples:
+            metrics = client.vm_disk_usage_metrics(vm.get("href") or "")
+            used_kib = metrics.get("used_kib")
+            prov_kib = metrics.get("provisioned_kib")
+            out.append(
+                {
+                    "vm": vm.get("name"),
+                    "vapp": vm.get("vapp"),
+                    "vdc": vm.get("vdc"),
+                    "hdd_assigned_gib": vm.get("hdd_assigned_gib"),
+                    "hdd_allok_gib": vm.get("hdd_gib"),
+                    "metrics_ok": bool(metrics.get("ok")),
+                    "status_code": metrics.get("status_code"),
+                    "detail": metrics.get("detail") or "",
+                    "metric_names": metrics.get("metric_names") or [],
+                    "used_gib": round(float(used_kib) / 1024.0 / 1024.0, 2)
+                    if used_kib is not None
+                    else None,
+                    "provisioned_gib": round(float(prov_kib) / 1024.0 / 1024.0, 2)
+                    if prov_kib is not None
+                    else None,
+                }
+            )
+        return out
+
+    results = await asyncio.to_thread(_probe)
+    ok_count = sum(1 for r in results if r.get("metrics_ok") and r.get("used_gib") is not None)
+    return {
+        "vdc_filter": vdc or None,
+        "checked": len(results),
+        "with_used_metric": ok_count,
+        "available": ok_count > 0,
+        "note": (
+            "disk.used.latest = Storage-Belegung (Thin), nicht Gast-OS-Frei/Belegt."
+            if ok_count
+            else "Metriken nicht verfügbar (Hoster hat sie oft deaktiviert) → HDD in use bleibt leer."
+        ),
+        "vms": results,
+    }
+
+
 def _filtered_inventory(
     data: list[dict[str, Any]],
     vdc: str = "",
@@ -297,6 +364,13 @@ def _filtered_inventory(
             filtered["hdd_gib"] = round(sum(float(vm.get("hdd_gib") or 0) for vm in vms), 1)
             filtered["hdd_assigned_gib"] = round(
                 sum(float(vm.get("hdd_assigned_gib") or 0) for vm in vms), 1
+            )
+            used_vms = [vm for vm in vms if vm.get("hdd_used_from_api")]
+            filtered["hdd_used_from_api"] = bool(used_vms)
+            filtered["hdd_used_gib"] = (
+                round(sum(float(vm.get("hdd_used_gib") or 0) for vm in used_vms), 1)
+                if used_vms
+                else 0.0
             )
         result.append(filtered)
 
@@ -336,6 +410,8 @@ def _inventory_totals(filtered: list[dict[str, Any]]) -> dict[str, float]:
     ram = 0.0
     hdd = 0.0
     hdd_assigned = 0.0
+    hdd_used = 0.0
+    hdd_used_any = False
     vms = 0
     # Assumption: 1 external IP per VDC
     ips = len({(item.get("vdc") or "").strip() for item in filtered if (item.get("vdc") or "").strip()})
@@ -347,12 +423,19 @@ def _inventory_totals(filtered: list[dict[str, Any]]) -> dict[str, float]:
             ram += sum(float(vm.get("ram_gib") or 0) for vm in vm_list)
             hdd += sum(float(vm.get("hdd_gib") or 0) for vm in vm_list)
             hdd_assigned += sum(float(vm.get("hdd_assigned_gib") or 0) for vm in vm_list)
+            for vm in vm_list:
+                if vm.get("hdd_used_from_api"):
+                    hdd_used_any = True
+                    hdd_used += float(vm.get("hdd_used_gib") or 0)
         else:
             cpu += float(item.get("cpu") or 0)
             ram += float(item.get("ram_gib") or 0)
             hdd += float(item.get("hdd_gib") or 0)
             hdd_assigned += float(item.get("hdd_assigned_gib") or 0)
-    # HDD cost base = assigned, fallback to used
+            if item.get("hdd_used_from_api"):
+                hdd_used_any = True
+                hdd_used += float(item.get("hdd_used_gib") or 0)
+    # HDD cost base = assigned, fallback to allocation
     hdd_billable = hdd_assigned if hdd_assigned > 0 else hdd
     return {
         "vapps": float(len(filtered)),
@@ -361,6 +444,8 @@ def _inventory_totals(filtered: list[dict[str, Any]]) -> dict[str, float]:
         "ram_gib": round(ram, 1),
         "hdd_gib": round(hdd, 1),
         "hdd_assigned_gib": round(hdd_assigned, 1),
+        "hdd_used_gib": round(hdd_used, 1) if hdd_used_any else 0.0,
+        "hdd_used_available": 1.0 if hdd_used_any else 0.0,
         "hdd_billable_gib": round(hdd_billable, 1),
         "ips": float(ips),
     }
@@ -439,10 +524,6 @@ async def export_csv(
         "vapp",
         "vapp_status",
         "vdc",
-        "vapp_cpu",
-        "vapp_ram_gib",
-        "vapp_hdd_assigned_gib",
-        "vapp_hdd_gib",
         "vm",
         "vm_status",
         "os",
@@ -450,7 +531,7 @@ async def export_csv(
         "ram_gib",
         "hdd_assigned_gib",
         "hdd_disks",
-        "hdd_gib",
+        "hdd_used_gib",
         "network",
     ]
     writer = csv.DictWriter(buf, fieldnames=fieldnames, delimiter=";")
@@ -467,8 +548,8 @@ async def export_csv(
     buf.write(f"Menge CPU (vCPU);{summary['cpu']}\n")
     buf.write(f"Menge RAM (GiB);{summary['ram_gib']}\n")
     buf.write(f"Menge HDD zugewiesen (GiB);{summary['hdd_assigned_gib']}\n")
-    buf.write(f"Menge HDD Verbrauch (GiB);{summary['hdd_gib']}\n")
-    buf.write(f"Menge HDD Kostenbasis (GiB);{summary['hdd_billable_gib']}\n")
+    used_label = summary["hdd_used_gib"] if summary.get("hdd_used_available") else "n/a"
+    buf.write(f"Menge HDD in use (GiB);{used_label}\n")
     buf.write(f"Menge IP (1 pro VDC);{int(summary['ips'])}\n")
     buf.write(f"Menge Edge GW (1 pro VDC);{int(summary['edges'])}\n")
     buf.write(f"Kosten CPU (CHF);{summary['cost_cpu']}\n")
@@ -521,10 +602,6 @@ async def export_xlsx(
         "vApp",
         "vApp Status",
         "VDC",
-        "vApp CPU",
-        "vApp RAM (GiB)",
-        "vApp HDD zugewiesen (GiB)",
-        "vApp HDD Verbrauch (GiB)",
         "VM",
         "VM Status",
         "OS",
@@ -532,7 +609,7 @@ async def export_xlsx(
         "RAM (GiB)",
         "HDD zugewiesen (GiB)",
         "Festplatten (einzeln)",
-        "HDD Verbrauch (GiB)",
+        "HDD in use (GiB)",
         "Netzwerk",
     ]
     ws.append(headers)
@@ -550,10 +627,6 @@ async def export_xlsx(
                 row["vapp"],
                 row["vapp_status"],
                 row["vdc"],
-                row["vapp_cpu"],
-                row["vapp_ram_gib"],
-                row["vapp_hdd_assigned_gib"],
-                row["vapp_hdd_gib"],
                 row["vm"],
                 row["vm_status"],
                 row["os"],
@@ -561,18 +634,18 @@ async def export_xlsx(
                 row["ram_gib"],
                 row["hdd_assigned_gib"],
                 row.get("hdd_disks") or "",
-                row["hdd_gib"],
+                row.get("hdd_used_gib", ""),
                 row["network"],
             ]
         )
 
     data_end = ws.max_row
-    widths = [36, 14, 28, 10, 14, 16, 16, 28, 14, 36, 8, 12, 16, 40, 16, 20]
+    widths = [28, 14, 24, 28, 14, 40, 8, 12, 16, 44, 16, 18]
     for idx, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = width
 
     if data_end >= 1:
-        ws.auto_filter.ref = f"A1:P{data_end}"
+        ws.auto_filter.ref = f"A1:L{data_end}"
     ws.freeze_panes = "A2"
 
     # Cost block at the bottom
@@ -612,22 +685,25 @@ async def export_xlsx(
         (start + 9, "Menge CPU (vCPU)", summary["cpu"]),
         (start + 10, "Menge RAM (GiB)", summary["ram_gib"]),
         (start + 11, "Menge HDD zugewiesen (GiB)", summary["hdd_assigned_gib"]),
-        (start + 12, "Menge HDD Verbrauch (GiB)", summary["hdd_gib"]),
-        (start + 13, "Menge HDD Kostenbasis (GiB)", summary["hdd_billable_gib"]),
-        (start + 14, "Menge IP (1 pro VDC)", int(summary["ips"])),
         (
-            start + 15,
+            start + 12,
+            "Menge HDD in use (GiB)",
+            summary["hdd_used_gib"] if summary.get("hdd_used_available") else "n/a",
+        ),
+        (start + 13, "Menge IP (1 pro VDC)", int(summary["ips"])),
+        (
+            start + 14,
             "Menge Edge GW (1 pro VDC)",
             int(summary["edges"]),
         ),
     ]
     cost_rows = [
-        (start + 17, "Kosten CPU (CHF)", summary["cost_cpu"]),
-        (start + 18, "Kosten RAM (CHF)", summary["cost_ram"]),
-        (start + 19, "Kosten HDD (CHF)", summary["cost_hdd"]),
-        (start + 20, "Kosten IP (CHF)", summary["cost_ip"]),
-        (start + 21, "Kosten Edge GW (CHF)", summary["cost_edge"]),
-        (start + 22, "Gesamtkosten (CHF)", summary["cost_total"]),
+        (start + 16, "Kosten CPU (CHF)", summary["cost_cpu"]),
+        (start + 17, "Kosten RAM (CHF)", summary["cost_ram"]),
+        (start + 18, "Kosten HDD (CHF)", summary["cost_hdd"]),
+        (start + 19, "Kosten IP (CHF)", summary["cost_ip"]),
+        (start + 20, "Kosten Edge GW (CHF)", summary["cost_edge"]),
+        (start + 21, "Gesamtkosten (CHF)", summary["cost_total"]),
     ]
 
     for r, label, value in price_rows + qty_rows + cost_rows:
@@ -638,8 +714,8 @@ async def export_xlsx(
         elif "Preis" in label:
             cell.number_format = "#,##0.00"
 
-    total_cell_label = ws.cell(start + 22, 1)
-    total_cell_value = ws.cell(start + 22, 2)
+    total_cell_label = ws.cell(start + 21, 1)
+    total_cell_value = ws.cell(start + 21, 2)
     total_cell_label.fill = total_fill
     total_cell_label.font = total_font
     total_cell_value.fill = total_fill

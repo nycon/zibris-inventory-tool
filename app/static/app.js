@@ -211,6 +211,8 @@
     let ram = 0;
     let storage = 0;
     let storageAssigned = 0;
+    let storageUsed = 0;
+    let storageUsedAny = false;
     let vms = 0;
     // Annahme: 1 externe IP pro VDC
     const ips = new Set(visible.map((v) => v.vdc).filter(Boolean)).size;
@@ -225,11 +227,28 @@
           (s, vm) => s + (Number(vm.hdd_assigned_gib) || 0),
           0
         );
+        for (const vm of list) {
+          if (vm.hdd_used_from_api) {
+            storageUsedAny = true;
+            storageUsed += Number(vm.hdd_used_gib) || 0;
+          }
+        }
       } else {
         cpu += Number(v.cpu) || 0;
         ram += Number(v.ram_gib) || 0;
         storage += Number(v.hdd_gib) || 0;
         storageAssigned += Number(v.hdd_assigned_gib) || 0;
+        if (v.hdd_used_from_api) {
+          storageUsedAny = true;
+          storageUsed += Number(v.hdd_used_gib) || 0;
+        } else {
+          for (const vm of v.vms || []) {
+            if (vm.hdd_used_from_api) {
+              storageUsedAny = true;
+              storageUsed += Number(vm.hdd_used_gib) || 0;
+            }
+          }
+        }
       }
     }
     return {
@@ -237,6 +256,8 @@
       ram,
       storage,
       storageAssigned,
+      storageUsed,
+      storageUsedAny,
       ips,
       edges: ips,
       vms,
@@ -337,13 +358,21 @@
   }
 
   function updateStats() {
-    const { cpu, ram, storage, storageAssigned, vms, vapps } = visibleResources();
+    const { cpu, ram, storage, storageAssigned, storageUsed, storageUsedAny, vms, vapps } =
+      visibleResources();
     $("#stat-vapps").textContent = String(vapps);
     $("#stat-vms").textContent = String(vms);
     $("#stat-cpu").textContent = `${cpu} vCPU`;
     $("#stat-ram").textContent = fmtGib(ram);
     if (hddAssignedOn) {
       $("#stat-hdd-assigned").textContent = fmtStorageTotal(storageAssigned);
+    }
+    const usedEl = $("#stat-storage-used");
+    if (usedEl) {
+      usedEl.textContent = storageUsedAny ? fmtStorageTotal(storageUsed) : "—";
+      usedEl.title = storageUsedAny
+        ? "VCD-Metrik disk.used.latest (Storage-Belegung)"
+        : "Keine HDD-in-use-Metriken (HDD konfig. laden oder Hoster ohne Metriken)";
     }
     $("#stat-storage").textContent = fmtStorageTotal(storage);
     $("#stat-at").textContent = inventoryAt || "—";
@@ -384,6 +413,13 @@
     return vms.filter((vm) => vm.status === status);
   }
 
+  function fmtUsedCell(vmOrVapp) {
+    if (vmOrVapp && vmOrVapp.hdd_used_from_api) {
+      return escapeHtml(fmtGib(vmOrVapp.hdd_used_gib));
+    }
+    return `<span class="muted" title="Metrik nicht verfügbar">—</span>`;
+  }
+
   function render() {
     const q = (searchInput.value || "").trim().toLowerCase();
     const status = statusFilter.value;
@@ -417,7 +453,7 @@
                     : ""
                 }
               </td>
-              <td class="num hdd" title="VCD allokiert ohne RAM">${escapeHtml(fmtGib(vm.hdd_gib))}</td>
+              <td class="num hdd" title="Storage in use (disk.used)">${fmtUsedCell(vm)}</td>
               <td class="netz">${escapeHtml(vm.network)}</td>
               <td class="muted">${escapeHtml(vm.os)}</td>
             </tr>`
@@ -443,7 +479,7 @@
                   : ""
               }
             </td>
-            <td class="num" title="VCD allokiert ohne RAM">${escapeHtml(fmtGib(vapp.hdd_gib))}</td>
+            <td class="num" title="Storage in use (disk.used)">${fmtUsedCell(vapp)}</td>
             <td class="num">${escapeHtml(vapp.vm_count)}</td>
           </tr>
           <tr class="vm-details" ${open ? "" : "hidden"}>
@@ -455,7 +491,7 @@
                       hddAssignedOn
                         ? `<th class="num hdd col-hdd-assigned">HDD konfig.</th>`
                         : ""
-                    }<th class="num hdd">HDD allok.</th><th class="netz">Netz</th><th>OS</th>
+                    }<th class="num hdd">HDD in use</th><th class="netz">Netz</th><th>OS</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -602,7 +638,7 @@
       if (!inventoryHasDiskDetails(inventory)) {
         try {
           await loadInventory(true);
-          showToast("HDD konfig. geladen – Einzeldisks unter HDD konfig.");
+          showToast("HDD konfig. + in use geladen");
         } catch (ex) {
           showToast(ex.message || String(ex));
           setHddAssignedUi(false);
