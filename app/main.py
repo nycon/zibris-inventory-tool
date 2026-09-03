@@ -165,10 +165,8 @@ async def login(body: LoginBody, request: Request) -> dict[str, Any]:
 
     def _do_login() -> tuple[dict[str, Any], list[dict[str, Any]]]:
         session = client.login()
-        inventory = _fetch_inventory(
-            client,
-            include_hdd_assigned=bool(body.include_hdd_assigned),
-        )
+        # Always enrich with disk API + usage metrics so "HDD in use" shows on login
+        inventory = _fetch_inventory(client, include_hdd_assigned=True)
         return session, inventory
 
     try:

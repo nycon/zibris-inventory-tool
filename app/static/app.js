@@ -587,11 +587,9 @@
       username: fd.get("username"),
       org: fd.get("org"),
       password: fd.get("password"),
-      include_hdd_assigned: hddAssignedOn,
+      include_hdd_assigned: true,
     };
-    showLoading(
-      hddAssignedOn ? "Anmelden & HDD konfig. laden…" : "Anmelden…"
-    );
+    showLoading("Anmelden & HDD in use laden…");
     try {
       const result = await api("/api/login", {
         method: "POST",
