@@ -611,8 +611,8 @@ async def export_xlsx(
         "Netzwerk",
     ]
     ws.append(headers)
-    header_fill = PatternFill("solid", fgColor="0F3D3E")
-    header_font = Font(color="F4F7F5", bold=True)
+    header_fill = PatternFill("solid", fgColor="053856")
+    header_font = Font(color="F4F8F8", bold=True)
     for col, _ in enumerate(headers, start=1):
         cell = ws.cell(1, col)
         cell.fill = header_fill
@@ -648,11 +648,11 @@ async def export_xlsx(
 
     # Cost block at the bottom
     start = data_end + 2
-    section_fill = PatternFill("solid", fgColor="0F3D3E")
-    section_font = Font(color="F4F7F5", bold=True)
+    section_fill = PatternFill("solid", fgColor="053856")
+    section_font = Font(color="F4F8F8", bold=True)
     label_font = Font(bold=True)
-    total_fill = PatternFill("solid", fgColor="C45C26")
-    total_font = Font(color="F4F7F5", bold=True)
+    total_fill = PatternFill("solid", fgColor="007DA5")
+    total_font = Font(color="F4F8F8", bold=True)
 
     ws.cell(start, 1, "VM Berechnung").font = section_font
     ws.cell(start, 1).fill = section_fill
