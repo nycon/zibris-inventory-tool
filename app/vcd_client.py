@@ -260,6 +260,79 @@ class VcdClient:
             if owns:
                 http.close()
 
+    def vm_ip_addresses(self, vm_href: str, client: httpx.Client | None = None) -> str:
+        """NIC IPs from the VM network connection section. Query ipAddress is often empty."""
+        if not vm_href:
+            return ""
+        url = f"{vm_href.rstrip('/')}/networkConnectionSection"
+        owns = client is None
+        http = client or httpx.Client(timeout=min(self.timeout, 30.0), verify=True)
+        try:
+            headers_json = {
+                "Authorization": f"Bearer {self.token}",
+                "Accept": f"application/*+json;version={self.api_version}",
+            }
+            resp = http.get(url, headers=headers_json)
+            if resp.status_code == 200 and resp.text:
+                try:
+                    ips = _parse_ips_from_network(resp.text, resp.headers.get("content-type", "application/json"))
+                except Exception:  # noqa: BLE001
+                    ips = []
+                if ips:
+                    return ", ".join(ips)
+
+            headers_xml = {
+                "Authorization": f"Bearer {self.token}",
+                "Accept": f"application/*+xml;version={self.api_version}",
+            }
+            resp_xml = http.get(url, headers=headers_xml)
+            if resp_xml.status_code == 200 and resp_xml.text:
+                ips = _parse_ips_from_network(
+                    resp_xml.text, resp_xml.headers.get("content-type", "application/xml")
+                )
+                return ", ".join(ips)
+            return ""
+        except Exception:  # noqa: BLE001
+            return ""
+        finally:
+            if owns:
+                http.close()
+
+    def enrich_vm_ips(self, inventory: list[dict], max_workers: int = 16) -> list[dict]:
+        """Fill VM IPs when the query record did not include ipAddress."""
+        targets: list[dict] = []
+        for vapp in inventory:
+            for vm in vapp.get("vms") or []:
+                if vm.get("href") and not (vm.get("ip") or "").strip():
+                    targets.append(vm)
+        if not targets:
+            return inventory
+
+        def _one(vm: dict) -> tuple[str, str]:
+            with httpx.Client(timeout=min(self.timeout, 30.0), verify=True) as client:
+                return vm.get("href") or "", self.vm_ip_addresses(vm.get("href") or "", client=client)
+
+        by_href: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(_one, vm) for vm in targets]
+            for fut in as_completed(futures):
+                try:
+                    href, ip = fut.result()
+                except Exception:  # noqa: BLE001
+                    continue
+                if href:
+                    by_href[href] = ip
+
+        filled = 0
+        for vapp in inventory:
+            for vm in vapp.get("vms") or []:
+                ip = by_href.get(vm.get("href") or "", "")
+                if ip:
+                    vm["ip"] = ip
+                    filled += 1
+        print(f"[zibris] VM IPs: {filled}/{len(targets)} via networkConnectionSection", flush=True)
+        return inventory
+
     def enrich_assigned_disks(self, inventory: list[dict], max_workers: int = 16) -> list[dict]:
         """Configured HDD + optional datastore 'in use' metrics per VM."""
         targets: list[dict] = []
@@ -280,36 +353,41 @@ class VcdClient:
 
         def _one(
             vm: dict,
-        ) -> tuple[str, float, int, list[dict[str, Any]], dict[str, Any]]:
+        ) -> tuple[str, float, int, list[dict[str, Any]], dict[str, Any], str]:
             with httpx.Client(timeout=min(self.timeout, 45.0), verify=True) as client:
                 href = vm.get("href") or ""
                 mb, count, disks = self.vm_disk_capacity_mb(href, client=client)
                 metrics = self.vm_disk_usage_metrics(href, client=client)
-            return href, mb, count, disks, metrics
+                ip = (vm.get("ip") or "").strip() or self.vm_ip_addresses(href, client=client)
+            return href, mb, count, disks, metrics, ip
 
-        by_href: dict[str, tuple[float, int, list[dict[str, Any]], dict[str, Any]]] = {}
+        by_href: dict[str, tuple[float, int, list[dict[str, Any]], dict[str, Any], str]] = {}
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [pool.submit(_one, vm) for vm in targets]
             for fut in as_completed(futures):
                 try:
-                    href, mb, count, disks, metrics = fut.result()
+                    href, mb, count, disks, metrics, ip = fut.result()
                 except Exception:  # noqa: BLE001
                     continue
                 if href:
-                    by_href[href] = (mb, count, disks, metrics)
+                    by_href[href] = (mb, count, disks, metrics, ip)
 
         api_ok = 0
         used_ok = 0
+        ip_ok = 0
         metric_status: Counter[str] = Counter()
         for vapp in inventory:
             assigned_total = 0.0
             used_total = 0.0
             used_any = False
             for vm in vapp.get("vms") or []:
-                mb, count, disks, metrics = by_href.get(
+                mb, count, disks, metrics, ip = by_href.get(
                     vm.get("href") or "",
-                    (0.0, 0, [], {"ok": False, "status_code": 0, "detail": "missing"}),
+                    (0.0, 0, [], {"ok": False, "status_code": 0, "detail": "missing"}, ""),
                 )
+                if ip:
+                    vm["ip"] = ip
+                    ip_ok += 1
                 from_api = mb > 0 and bool(disks)
                 if from_api:
                     api_ok += 1
@@ -369,6 +447,7 @@ class VcdClient:
         print(
             f"[zibris] HDD configured: {api_ok}/{len(targets)} VMs via disk API; "
             f"HDD in use (metrics): {used_ok}/{len(targets)}; "
+            f"VM IPs: {ip_ok}/{len(targets)}; "
             f"metric_status={dict(metric_status)}; "
             f"Disk-Anzahlen={dict(Counter(len((vm.get('hdd_disks') or [])) for v in inventory for vm in (v.get('vms') or [])))}",
             flush=True,
@@ -398,6 +477,71 @@ class VcdClient:
         for vapp in inventory:
             vapp["hdd_metrics_checked"] = True
         return inventory
+
+
+def _usable_ip(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text or text.lower() in {"none", "null", "n/a", "-", "0.0.0.0"}:
+        return ""
+    return text
+
+
+def _parse_ips_from_network(body: str, content_type: str = "") -> list[str]:
+    """Collect NIC IPs. Prefer configured addresses over external NAT addresses."""
+    text = (body or "").strip()
+    if not text:
+        return []
+    ct = (content_type or "").lower()
+    primary: list[str] = []
+    external: list[str] = []
+
+    def _add(bucket: list[str], value: Any) -> None:
+        ip = _usable_ip(value)
+        if ip and ip not in bucket and ip not in primary:
+            bucket.append(ip)
+
+    if "json" in ct or text.startswith("{") or text.startswith("["):
+        try:
+            import json
+
+            data = json.loads(text)
+        except Exception:  # noqa: BLE001
+            data = None
+        connections: list[Any] = []
+        if isinstance(data, dict):
+            for key in ("networkConnection", "NetworkConnection"):
+                val = data.get(key)
+                if isinstance(val, list):
+                    connections = val
+                    break
+                if isinstance(val, dict):
+                    connections = [val]
+                    break
+        elif isinstance(data, list):
+            connections = data
+        for item in connections:
+            if not isinstance(item, dict):
+                continue
+            _add(primary, item.get("ipAddress") or item.get("IpAddress"))
+            _add(external, item.get("externalIpAddress") or item.get("ExternalIpAddress"))
+        return primary or external
+
+    for match in re.finditer(
+        r"<(?:[\w.-]+:)?IpAddress>\s*([^<]+?)\s*</(?:[\w.-]+:)?IpAddress>",
+        text,
+        flags=re.I,
+    ):
+        _add(primary, match.group(1))
+    for match in re.finditer(
+        r"<(?:[\w.-]+:)?ExternalIpAddress>\s*([^<]+?)\s*</(?:[\w.-]+:)?ExternalIpAddress>",
+        text,
+        flags=re.I,
+    ):
+        _add(external, match.group(1))
+    if not primary:
+        for match in re.finditer(r'\bipAddress="([^"]+)"', text, flags=re.I):
+            _add(primary, match.group(1))
+    return primary or external
 
 
 def mib_to_gib(value: Any) -> float:
@@ -809,6 +953,7 @@ def normalize_inventory(
             "hdd_disk_count": 0,
             "hdd_disks": [],
             "network": vm.get("networkName") or "—",
+            "ip": (vm.get("ipAddress") or "").strip(),
             "href": vm.get("href") or "",
         }
         href = vm.get("container") or ""
@@ -886,6 +1031,7 @@ def flatten_rows(inventory: list[dict]) -> list[dict]:
                     "hdd_assigned_gib": vapp.get("hdd_assigned_gib") or 0,
                     "hdd_disks": _disks_label(vapp.get("hdd_disks")),
                     "hdd_used_gib": _used_export(vapp),
+                    "ip": "",
                     "network": "",
                 }
             )
@@ -904,6 +1050,7 @@ def flatten_rows(inventory: list[dict]) -> list[dict]:
                     "hdd_assigned_gib": vm.get("hdd_assigned_gib") or 0,
                     "hdd_disks": _disks_label(vm.get("hdd_disks")),
                     "hdd_used_gib": _used_export(vm),
+                    "ip": vm.get("ip") or "",
                     "network": vm["network"] if vm["network"] != "—" else "",
                 }
             )

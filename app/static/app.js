@@ -400,7 +400,7 @@
       vapp.name,
       vapp.vdc,
       vapp.status,
-      ...(vapp.vms || []).flatMap((vm) => [vm.name, vm.os, vm.network]),
+      ...(vapp.vms || []).flatMap((vm) => [vm.name, vm.os, vm.network, vm.ip]),
     ]
       .join(" ")
       .toLowerCase();
@@ -418,6 +418,20 @@
       return escapeHtml(fmtGib(vmOrVapp.hdd_used_gib));
     }
     return `<span class="muted" title="Metrik nicht verfügbar">—</span>`;
+  }
+
+  function fmtIpList(vms) {
+    const ips = [];
+    for (const vm of vms || []) {
+      const ip = String(vm.ip || "").trim();
+      if (ip && !ips.includes(ip)) ips.push(ip);
+    }
+    return ips.length ? ips.join(", ") : "—";
+  }
+
+  function fmtIp(ip) {
+    const value = String(ip || "").trim();
+    return value ? escapeHtml(value) : `<span class="muted">—</span>`;
   }
 
   function render() {
@@ -454,6 +468,7 @@
                 }
               </td>
               <td class="num hdd" title="Storage in use (disk.used)">${fmtUsedCell(vm)}</td>
+              <td class="ip">${fmtIp(vm.ip)}</td>
               <td class="netz">${escapeHtml(vm.network)}</td>
               <td class="muted">${escapeHtml(vm.os)}</td>
             </tr>`
@@ -480,10 +495,11 @@
               }
             </td>
             <td class="num" title="Storage in use (disk.used)">${fmtUsedCell(vapp)}</td>
+            <td class="ip" title="${escapeHtml(fmtIpList(vapp.vms))}">${escapeHtml(fmtIpList(vapp.vms))}</td>
             <td class="num">${escapeHtml(vapp.vm_count)}</td>
           </tr>
           <tr class="vm-details" ${open ? "" : "hidden"}>
-            <td colspan="${hddAssignedOn ? 9 : 8}">
+            <td colspan="${hddAssignedOn ? 10 : 9}">
               <table class="vm-table">
                 <thead>
                   <tr>
@@ -491,13 +507,13 @@
                       hddAssignedOn
                         ? `<th class="num hdd col-hdd-assigned">HDD konfig.</th>`
                         : ""
-                    }<th class="num hdd">HDD in use</th><th class="netz">Netz</th><th>OS</th>
+                    }<th class="num hdd">HDD in use</th><th>IP</th><th class="netz">Netz</th><th>OS</th>
                   </tr>
                 </thead>
                 <tbody>
                   ${
                     vmRows ||
-                    `<tr><td colspan="${hddAssignedOn ? 8 : 7}" class="muted">Keine VMs in dieser vApp.</td></tr>`
+                    `<tr><td colspan="${hddAssignedOn ? 9 : 8}" class="muted">Keine VMs in dieser vApp.</td></tr>`
                   }
                 </tbody>
               </table>

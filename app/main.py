@@ -118,8 +118,9 @@ def _fetch_inventory(
     vms = client.query_all("vm", filter_expr="isVAppTemplate==false")
     inventory = normalize_inventory(vapps, vms)
     if include_hdd_assigned:
+        # Disk enrichment also loads NIC IPs.
         return client.enrich_assigned_disks(inventory)
-    return inventory
+    return client.enrich_vm_ips(inventory)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -530,6 +531,7 @@ async def export_csv(
         "hdd_assigned_gib",
         "hdd_disks",
         "hdd_used_gib",
+        "ip",
         "network",
     ]
     writer = csv.DictWriter(buf, fieldnames=fieldnames, delimiter=";")
@@ -608,6 +610,7 @@ async def export_xlsx(
         "HDD zugewiesen (GiB)",
         "Festplatten (einzeln)",
         "HDD in use (GiB)",
+        "IP",
         "Netzwerk",
     ]
     ws.append(headers)
@@ -633,17 +636,18 @@ async def export_xlsx(
                 row["hdd_assigned_gib"],
                 row.get("hdd_disks") or "",
                 row.get("hdd_used_gib", ""),
+                row.get("ip") or "",
                 row["network"],
             ]
         )
 
     data_end = ws.max_row
-    widths = [28, 14, 24, 28, 14, 40, 8, 12, 16, 44, 16, 18]
+    widths = [28, 14, 24, 28, 14, 40, 8, 12, 16, 44, 16, 18, 18]
     for idx, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = width
 
     if data_end >= 1:
-        ws.auto_filter.ref = f"A1:L{data_end}"
+        ws.auto_filter.ref = f"A1:M{data_end}"
     ws.freeze_panes = "A2"
 
     # Cost block at the bottom
